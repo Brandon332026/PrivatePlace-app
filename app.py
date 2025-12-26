@@ -1,42 +1,17 @@
 import streamlit as st
-import json
-import os
 from datetime import datetime
 import hashlib
-
-# File paths for data storage
-USERS_FILE = "users.json"
-ADS_FILE = "ads.json"
+import uuid
+from PIL import Image
+import io
+from firebase_config import get_db, get_storage
 
 # PayPal donation link
 PAYPAL_DONATE_URL = "https://www.paypal.com/ncp/payment/JBDVRK4T8GLPJ"
 
-# Initialize data files
-def init_data_files():
-    if not os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'w') as f:
-            json.dump({}, f)
-    if not os.path.exists(ADS_FILE):
-        with open(ADS_FILE, 'w') as f:
-            json.dump([], f)
-
-# Load data
-def load_users():
-    with open(USERS_FILE, 'r') as f:
-        return json.load(f)
-
-def load_ads():
-    with open(ADS_FILE, 'r') as f:
-        return json.load(f)
-
-# Save data
-def save_users(users):
-    with open(USERS_FILE, 'w') as f:
-        json.dump(users, f, indent=2)
-
-def save_ads(ads):
-    with open(ADS_FILE, 'w') as f:
-        json.dump(ads, f, indent=2)
+# Initialize Firestore
+db = get_db()
+bucket = get_storage()
 
 # Hash password
 def hash_password(password):
@@ -45,6 +20,34 @@ def hash_password(password):
 # Check if user is admin
 def is_admin(username):
     return username == "admin"
+
+# Upload image to Firebase Storage
+def upload_image(image_file, ad_id):
+    """Upload image to Firebase Storage and return public URL"""
+    try:
+        # Generate unique filename
+        ext = image_file.name.split('.')[-1]
+        filename = f"ads/{ad_id}/{uuid.uuid4()}.{ext}"
+        
+        # Resize image if too large
+        img = Image.open(image_file)
+        max_size = (1200, 1200)
+        img.thumbnail(max_size, Image.Resampling.LANCZOS)
+        
+        # Convert to bytes
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format=img.format if img.format else 'JPEG')
+        img_byte_arr.seek(0)
+        
+        # Upload to Firebase Storage
+        blob = bucket.blob(filename)
+        blob.upload_from_file(img_byte_arr, content_type=f'image/{ext}')
+        blob.make_public()
+        
+        return blob.public_url
+    except Exception as e:
+        st.error(f"Error uploading image: {str(e)}")
+        return None
 
 # Initialize session state
 def init_session_state():
@@ -57,9 +60,8 @@ def init_session_state():
 
 # Main app
 def main():
-    st.set_page_config(page_title="Adult Classifieds", page_icon=":material/search:", layout="wide")
+    st.set_page_config(page_title="PrivatePlace", page_icon=":material/search:", layout="wide")
     
-    init_data_files()
     init_session_state()
     
     # Age verification warning
@@ -67,7 +69,20 @@ def main():
         st.session_state.age_verified = False
     
     if not st.session_state.age_verified:
-        st.title("Age Verification Required")
+        # Add some spacing at the top
+        st.write("")
+        st.write("")
+        st.write("")
+        
+        # App branding
+        st.markdown("<h1 style='text-align: center;'>PrivatePlace</h1>", unsafe_allow_html=True)
+        st.markdown("<h3 style='text-align: center; color: #888;'>Adult Personal Ad's 100% Free</h3>", unsafe_allow_html=True)
+        
+        st.write("")
+        st.write("")
+        
+        # Age verification
+        st.markdown("<h2 style='text-align: center;'>Age Verification Required</h2>", unsafe_allow_html=True)
         st.warning("This site contains adult content. You must be 18 years or older to continue.")
         
         col1, col2, col3 = st.columns([1, 1, 1])
@@ -78,7 +93,8 @@ def main():
         return
     
     # Header
-    st.title("Adult Classifieds")
+    st.title("PrivatePlace")
+    st.caption("Adult Personal Ad's 100% Free")
     
     # Navigation and auth in sidebar
     with st.sidebar:
@@ -166,12 +182,17 @@ def login_or_register():
         password = st.text_input("Password", type="password", key="login_password")
         
         if st.button("Login", type="primary", use_container_width=True):
-            users = load_users()
-            if username in users and users[username]['password'] == hash_password(password):
-                st.session_state.logged_in = True
-                st.session_state.username = username
-                st.success("Login successful!")
-                st.rerun()
+            # Get user from Firestore
+            user_ref = db.collection('users').document(username).get()
+            if user_ref.exists:
+                user_data = user_ref.to_dict()
+                if user_data['password'] == hash_password(password):
+                    st.session_state.logged_in = True
+                    st.session_state.username = username
+                    st.success("Login successful!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
             else:
                 st.error("Invalid username or password")
     
@@ -193,26 +214,28 @@ def login_or_register():
             elif reg_password != reg_confirm_password:
                 st.error("Passwords do not match")
             else:
-                users = load_users()
-                if reg_username in users:
+                # Check if username exists
+                user_ref = db.collection('users').document(reg_username).get()
+                if user_ref.exists:
                     st.error("Username already exists")
                 else:
-                    users[reg_username] = {
+                    # Create new user
+                    db.collection('users').document(reg_username).set({
                         'name': reg_name,
                         'age': reg_age,
                         'location': reg_location,
                         'looking_for': reg_looking_for,
                         'password': hash_password(reg_password),
-                        'created_at': datetime.now().isoformat()
-                    }
-                    save_users(users)
+                        'created_at': datetime.now()
+                    })
                     st.success("Registration successful! Please login.")
 
 def browse_ads():
     st.header("Browse Ads")
     
-    ads = load_ads()
-    approved_ads = [ad for ad in ads if ad['status'] == 'approved']
+    # Get approved ads from Firestore
+    ads_ref = db.collection('ads').where('status', '==', 'approved').stream()
+    approved_ads = [{'id': doc.id, **doc.to_dict()} for doc in ads_ref]
     
     if not approved_ads:
         st.info("No ads available yet. Be the first to post!")
@@ -244,25 +267,36 @@ def browse_ads():
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     st.subheader(ad['title'])
+                    
+                    # Display image if exists
+                    if 'photo_url' in ad and ad['photo_url']:
+                        st.image(ad['photo_url'], use_container_width=True)
+                    
                     st.write(ad['description'])
                     if 'contact' in ad:
                         st.caption(f":material/contact_mail: {ad['contact']}")
                 with col2:
                     st.caption(f":material/location_on: {ad['location']}")
                     st.caption(f":material/person: {ad['age']} years old")
-                    st.caption(f":material/calendar_today: {ad['created_at'][:10]}")
+                    created_at = ad['created_at']
+                    if hasattr(created_at, 'strftime'):
+                        st.caption(f":material/calendar_today: {created_at.strftime('%Y-%m-%d')}")
                 st.divider()
 
 def post_ad():
     st.header("Post New Ad")
     
-    users = load_users()
-    user_data = users.get(st.session_state.username, {})
+    # Get user data
+    user_ref = db.collection('users').document(st.session_state.username).get()
+    user_data = user_ref.to_dict() if user_ref.exists else {}
     
     st.info("Your ad will be reviewed by our moderators before it goes live")
     
     title = st.text_input("Ad Title", placeholder="Enter a catchy title...")
     description = st.text_area("Description", placeholder="Describe what you're looking for...", height=200)
+    
+    # Photo upload
+    photo = st.file_uploader("Upload Photo (optional)", type=['jpg', 'jpeg', 'png'], help="Upload a photo for your ad")
     
     # Pre-fill location and age from user profile
     col1, col2 = st.columns(2)
@@ -279,9 +313,9 @@ def post_ad():
         elif age < 18:
             st.error("You must be 18 or older")
         else:
-            ads = load_ads()
-            new_ad = {
-                'id': len(ads) + 1,
+            # Create ad document
+            ad_id = str(uuid.uuid4())
+            ad_data = {
                 'username': st.session_state.username,
                 'title': title,
                 'description': description,
@@ -289,10 +323,18 @@ def post_ad():
                 'age': age,
                 'contact': contact,
                 'status': 'pending',
-                'created_at': datetime.now().isoformat()
+                'created_at': datetime.now()
             }
-            ads.append(new_ad)
-            save_ads(ads)
+            
+            # Upload photo if provided
+            if photo:
+                with st.spinner("Uploading photo..."):
+                    photo_url = upload_image(photo, ad_id)
+                    if photo_url:
+                        ad_data['photo_url'] = photo_url
+            
+            # Save ad to Firestore
+            db.collection('ads').document(ad_id).set(ad_data)
             st.success("Ad submitted! It will be visible once approved by a moderator.")
             st.session_state.view = 'my_ads'
             st.rerun()
@@ -300,8 +342,9 @@ def post_ad():
 def my_ads():
     st.header("My Ads")
     
-    ads = load_ads()
-    my_ads_list = [ad for ad in ads if ad['username'] == st.session_state.username]
+    # Get user's ads from Firestore
+    ads_ref = db.collection('ads').where('username', '==', st.session_state.username).stream()
+    my_ads_list = [{'id': doc.id, **doc.to_dict()} for doc in ads_ref]
     
     if not my_ads_list:
         st.info("You haven't posted any ads yet")
@@ -338,6 +381,11 @@ def my_ads():
 def display_my_ad(ad):
     with st.container():
         st.subheader(ad['title'])
+        
+        # Display image if exists
+        if 'photo_url' in ad and ad['photo_url']:
+            st.image(ad['photo_url'], width=300)
+        
         st.write(ad['description'])
         if 'contact' in ad:
             st.caption(f":material/contact_mail: {ad['contact']}")
@@ -347,7 +395,9 @@ def display_my_ad(ad):
         with col2:
             st.caption(f":material/person: {ad['age']} years old")
         with col3:
-            st.caption(f":material/calendar_today: {ad['created_at'][:10]}")
+            created_at = ad['created_at']
+            if hasattr(created_at, 'strftime'):
+                st.caption(f":material/calendar_today: {created_at.strftime('%Y-%m-%d')}")
         
         if ad['status'] == 'pending':
             st.warning("Awaiting approval")
@@ -361,35 +411,41 @@ def display_my_ad(ad):
 def admin_panel():
     st.header("Pending Ad Approvals")
     
-    ads = load_ads()
-    pending_ads = [ad for ad in ads if ad['status'] == 'pending']
+    # Get pending ads from Firestore
+    ads_ref = db.collection('ads').where('status', '==', 'pending').stream()
+    pending_ads = [{'id': doc.id, **doc.to_dict()} for doc in ads_ref]
     
     if not pending_ads:
         st.info("No pending ads to review")
         return
     
-    for idx, ad in enumerate(pending_ads):
+    for ad in pending_ads:
         with st.container():
             col1, col2 = st.columns([4, 1])
             
             with col1:
                 st.subheader(ad['title'])
+                
+                # Display image if exists
+                if 'photo_url' in ad and ad['photo_url']:
+                    st.image(ad['photo_url'], width=300)
+                
                 st.write(ad['description'])
                 if 'contact' in ad:
                     st.caption(f":material/contact_mail: {ad['contact']}")
                 st.caption(f"Posted by: {ad['username']} | Location: {ad['location']} | Age: {ad['age']}")
-                st.caption(f"Submitted: {ad['created_at'][:10]}")
+                created_at = ad['created_at']
+                if hasattr(created_at, 'strftime'):
+                    st.caption(f"Submitted: {created_at.strftime('%Y-%m-%d')}")
             
             with col2:
                 if st.button("Approve", key=f"approve_{ad['id']}", type="primary", icon=":material/check_circle:"):
-                    ad['status'] = 'approved'
-                    save_ads(ads)
+                    db.collection('ads').document(ad['id']).update({'status': 'approved'})
                     st.success("Ad approved!")
                     st.rerun()
                 
                 if st.button("Reject", key=f"reject_{ad['id']}", icon=":material/cancel:"):
-                    ad['status'] = 'rejected'
-                    save_ads(ads)
+                    db.collection('ads').document(ad['id']).update({'status': 'rejected'})
                     st.warning("Ad rejected")
                     st.rerun()
             
